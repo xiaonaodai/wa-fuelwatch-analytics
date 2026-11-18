@@ -1,0 +1,16 @@
+# History & Workspace files
+.Rhistory
+.RData
+.Ruserdata
+.Rproj.user/
+*.Rout
+*.log
+
+# Large Datasets (>350MB raw CSVs; download via instructions in datasets/README.md)
+datasets/*.csv
+!datasets/README.md
+!datasets/.gitkeep
+
+# OS specific files
+.DS_Store
+Thumbs.db

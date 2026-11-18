@@ -1,0 +1,1624 @@
+---
+title: "FuelWatch WA: Price patterns and classification"
+author: "Guoli XI"
+date: "January 2023 to August 2026"
+output:
+  html_document:
+    toc: true
+    toc_float: true
+    number_sections: true
+    code_folding: show
+    theme: flatly
+    self_contained: true
+params:
+  seed: 4009
+  train_cap: 1000000
+  calibration_cap: 1000000
+  svm_cap: 4000
+  bootstrap_reps: 200
+---
+
+<style>
+body {font-size:15px;line-height:1.65}
+.main-container {max-width:1150px}
+h1,h2,h3 {color:#173d50}
+pre {max-height:420px;overflow:auto}
+table {font-size:13px}
+</style>
+
+# Purpose
+
+This study analyses supplied FuelWatch raw exports for January 2023–August 2026.Data for September 2026 is outside the scope of this study.
+Each row represents a notified price at a specific site for a given product and date, rather than actual sales volume or transaction value. Prices are in cents per litre. 
+
+Core Research Questions:
+1. How do prices vary by date, product, brand and region?
+2. Can non-price attributes identify relatively cheap regular unleaded petrol (ULP) records? Specifically, does training the model on historical August data outperform training on data from May to July 2026—that is, is it better to use year-over-year (YoY) or month-over-month (MoM) data for training?
+3. Which price profiles distinguish ULP sites within a common observation window?
+
+These are observational associations; the impact of wars, exchange rates, and crude oil fluctuations cannot be identified from this dataset alone. Where external factors cause changes, I will provide reliable sources. Additionally, no precomputed trend, weekly, or monthly price tables from FuelWatch were used in this study.
+
+
+```{r setup}
+required <- c("data.table","ggplot2","e1071","pROC","ROCR","lime","gridExtra","cluster","knitr")
+missing <- required[!vapply(required, requireNamespace, logical(1), quietly=TRUE)]
+if (length(missing)) stop("Run setup.R. Missing: ", paste(missing, collapse=", "))
+library(data.table)
+library(ggplot2)
+setDTthreads(2)
+knitr::opts_chunk$set(echo=TRUE, message=FALSE, warning=TRUE,
+                     fig.width=10, fig.height=5.5, dpi=120)
+theme_set(theme_minimal(base_size=12))
+set.seed(params$seed)
+start_date <- as.Date("2023-01-01")
+test_start <- as.Date("2026-08-01")
+end_date <- as.Date("2026-08-31")
+dir.create("outputs", showWarnings=FALSE)
+tab <- function(x, digits=3) knitr::kable(as.data.frame(x), digits=digits)
+```
+
+# Provenance and data quality
+
+Source: FuelWatch historical retail price files published by the Western Australian
+Government, downloaded from <https://www.fuelwatch.wa.gov.au/retail/historic> on
+25 September 2026. One CSV per month was downloaded for January 2023 to September
+2026 and stored unchanged in `datasets/`. The manifest records filenames, MD5
+hashes, dates, counts and inspection date, to verify that the same
+files were used.
+
+```{r import}
+# Read a monthly file. Require the schema; ignore only entirely empty extra columns.
+read_month <- function(path) {
+  fields <- c("PUBLISH_DATE","TRADING_NAME","BRAND_DESCRIPTION","PRODUCT_DESCRIPTION",
+              "PRODUCT_PRICE","ADDRESS","LOCATION","POSTCODE","AREA_DESCRIPTION",
+              "REGION_DESCRIPTION")
+  x <- fread(path, colClasses="character", na.strings=c("","NA"))
+  if (length(setdiff(fields,names(x)))) stop("Missing fields in ",path)
+  extra <- setdiff(names(x), fields)
+  if (length(extra) && any(vapply(x[,..extra],
+      function(z) any(!is.na(z) & trimws(z)!=""), logical(1)))) {
+    stop("Unexpected nonempty columns: ",path)
+  }
+  x <- x[,..fields]
+  x[,source_file:=basename(path)]
+  x
+}
+paths <- sort(list.files("datasets",
+  pattern="^FuelWatchRetail-[0-9]{2}-[0-9]{4}\\.csv$", full.names=TRUE))
+if (!length(paths)) stop("No input CSV files.")
+file_month <- as.Date(sub("FuelWatchRetail-([0-9]{2})-([0-9]{4})\\.csv",
+                         "\\2-\\1-01",basename(paths)))
+in_scope <- file_month >= start_date & file_month <= test_start
+if (!setequal(file_month[in_scope],seq(start_date,test_start,by="month")) ||
+    anyDuplicated(file_month[in_scope])) stop("Expected one file for each of 44 months.")
+excluded_files <- basename(paths[!in_scope])
+paths <- paths[in_scope]
+raw <- rbindlist(lapply(paths,read_month),use.names=TRUE)
+raw[,date:=as.Date(PUBLISH_DATE,"%d/%m/%Y")]
+if (anyNA(raw$date)) stop("Unparseable dates; inspect source before proceeding.")
+manifest <- raw[,.(rows=.N, first=min(date), last=max(date), days=uniqueN(date)),
+                by=source_file]
+manifest[,md5:=unname(tools::md5sum(file.path("datasets",source_file)))]
+manifest[,inspected_on:=as.character(Sys.Date())]
+manifest[,expected_start:=as.Date(sub("FuelWatchRetail-([0-9]{2})-([0-9]{4})\\.csv",
+                                     "\\2-\\1-01",source_file))]
+manifest[,next_month:=as.Date(format(expected_start+32,"%Y-%m-01"))]
+manifest[,complete:=first==expected_start & last==next_month-1 &
+                      days==as.integer(next_month-expected_start)]
+if (any(!manifest$complete)) stop("Incomplete month; inspect manifest.")
+if (any(raw$date < start_date | raw$date > end_date)) stop("Dates outside scope.")
+fwrite(manifest,"outputs/input_manifest.csv")
+tab(manifest[,.(source_file,rows,first,last,days,complete)])
+cat("Excluded by study scope:",paste(excluded_files,collapse=", "))
+```
+
+```{r inspect}
+head(raw)
+str(raw)
+summary(suppressWarnings(as.numeric(raw$PRODUCT_PRICE)))
+```
+
+Text import preserves postcodes. Dates/prices are explicitly converted. Early
+exports have a trailing empty field; the reader verifies it is empty.
+I used `data.table::fread()` instead of the base `read.csv()` from Lab 5. Both
+read the same flat files, and `fread(colClasses="character")` does the same job
+as `read.csv(colClasses="character")`, but it is much faster for 44 files and
+3.8 million rows. All changes to the data and code are logged in `CHANGELOG.txt`.
+
+**What the first look tells me.** Each row is one site, one product, one day.
+`head()` shows that a single station (e.g. 53 Mile Roadhouse in Pinjarra) appears
+several times on the same date, once per fuel it sells, so the "unit" for most
+analysis has to be site × product × date, not the row on its own. `str()` shows
+that everything comes in as text, which is what I wanted: postcodes like 6208
+stay as labels instead of becoming numbers, and the date (`dd/mm/yyyy`) and price
+need explicit conversion. The price `summary()` runs from 109.7 to 450.0 c/L with
+a median of 191.9 and a mean of 195.9. The mean sitting above the median hints at
+a right tail, and since this mixes LPG, ULP and diesel together, I did not read
+too much into it until the products were separated below.
+
+## Cleaning policy
+
+Standardise whitespace and case; replace missing categories with UNKNOWN.
+Do not merge similar brands without evidence. Identify sites by address, locality
+and postcode; use trading name if address is absent. Where multiple records share
+an address/product/date, append trading name to that address for every period.
+This retains co-located named businesses without averaging their prices. A name
+change at an ambiguous address or a location change can create a new key;
+coverage changes are not automatically business openings or closures.
+
+Remove unusable prices and exact canonical duplicates, with a 5% removal guard.
+Conflicting site/product/date rows cause an explicit stop. Flag but retain
+positive extreme prices: remote locations can legitimately be expensive.
+
+```{r clean}
+clean_text <- function(x) {
+  y <- toupper(gsub("\\s+"," ",trimws(x)))
+  y[is.na(y)|y==""] <- "UNKNOWN"
+  y
+}
+normalisation <- rbindlist(lapply(c("BRAND_DESCRIPTION","LOCATION","REGION_DESCRIPTION"),
+ function(nm) data.table(field=nm,raw_levels=uniqueN(raw[[nm]]),
+                        clean_levels=uniqueN(clean_text(raw[[nm]])))))
+missing_audit <- data.table(field=names(raw),
+                           missing=vapply(raw,function(z) if (is.character(z)) sum(is.na(z)|z=="") else sum(is.na(z)),numeric(1)))
+d <- raw[,.(date,site_name=clean_text(TRADING_NAME),brand=clean_text(BRAND_DESCRIPTION),
+  product=clean_text(PRODUCT_DESCRIPTION),price=suppressWarnings(as.numeric(PRODUCT_PRICE)),
+  address=clean_text(ADDRESS),location=clean_text(LOCATION),postcode=clean_text(POSTCODE),
+  area=clean_text(AREA_DESCRIPTION),region=clean_text(REGION_DESCRIPTION),source_file)]
+raw_n <- nrow(d)
+bad <- !is.finite(d$price)|d$price<=0
+invalid_n <- sum(bad)
+d <- d[!bad]
+canonical <- setdiff(names(d),"source_file")
+before <- nrow(d)
+d <- unique(d,by=canonical)
+duplicate_n <- before-nrow(d)
+d[,site:=paste(address,location,postcode,sep=" | ")]
+d[address=="UNKNOWN",site:=paste(site_name,location,postcode,sep=" | ")]
+address_collisions <- d[, .N, by=.(site,product,date)][N>1]
+ambiguous_addresses <- unique(address_collisions$site)
+site_identity_audit <- d[site %in% ambiguous_addresses,
+  .(records=.N,names=paste(sort(unique(site_name)),collapse="; ")),by=site]
+fwrite(site_identity_audit,"outputs/site_identity_audit.csv")
+# Apply the same disambiguation throughout the study, not only on collision dates.
+d[site %in% ambiguous_addresses,site:=paste(site,site_name,sep=" | ")]
+conflicts <- d[, .N, by=.(site,product,date)][N>1]
+if (nrow(conflicts)) {
+  fwrite(conflicts,"outputs/conflicting_records.csv")
+  stop("Conflicting site/product/date rows; review outputs/conflicting_records.csv.")
+}
+quality <- data.table(step=c("Raw rows","Invalid price removed","Duplicates removed","Clean rows"),
+                      rows=c(raw_n,invalid_n,duplicate_n,nrow(d)))
+drop_rate <- (invalid_n+duplicate_n)/raw_n
+if (drop_rate>.05) stop("Cleaning removal exceeds 5%; review decisions.")
+d[,":="(year=as.integer(format(date,"%Y")), month=as.integer(format(date,"%m")),
+        month_date=as.Date(format(date,"%Y-%m-01")),day=as.integer(format(date,"%d")),
+        weekday=factor(as.POSIXlt(date)$wday,levels=0:6,
+                       labels=c("Sun","Mon","Tue","Wed","Thu","Fri","Sat")))]
+bounds <- d[,.(q1=quantile(price,.25),q3=quantile(price,.75)),by=product]
+d <- merge(d,bounds,by="product",all.x=TRUE,sort=FALSE)
+d[,extreme:=price<q1-3*(q3-q1)|price>q3+3*(q3-q1)]
+extremes <- d[,.(records=.N,flagged=sum(extreme),minimum=min(price),maximum=max(price)),by=product]
+tab(quality); tab(normalisation); tab(missing_audit); tab(extremes)
+cat(sprintf("Cleaning removal: %.4f%%",100*drop_rate))
+fwrite(quality,"outputs/cleaning_audit.csv")
+rm(raw)
+invisible(gc())
+```
+
+```{r quality-plot}
+ggplot(extremes,aes(product,flagged/records)) + geom_col(fill="#c36b39") +
+ labs(title="Extreme-price flags are a review aid, not a deletion rule",
+      x="Product",y="Fraction beyond product-wide 3-IQR fences")
+```
+
+The data turned out to be cleaner than I expected: no missing values in any
+field, no unparseable prices, and no exact duplicates, so no rows were dropped
+(well inside the 5% limit). Normalising case and spacing did not reduce the
+number of brand, location or region levels either, which suggests FuelWatch
+already standardises these fields. The real problem was site identity: some
+addresses host more than one trading name on the same day, which is why the
+disambiguation step above was needed before any site-level work.
+
+LPG has the largest share of extreme-price flags (about 6% of records, from a
+small base of 98 sites), followed by brand diesel and diesel (about 3.5% and
+2.5%), while E85 has none. I kept these rows. The high values are mostly
+from remote areas where 300+ c/L is plausible, and deleting them would make the
+Kimberley and Pilbara look cheaper than they really are.
+
+## Further checks before trusting the data
+
+Zero removed rows does not mean zero problems, so I ran a few more checks on
+things that would not show up as missing values or duplicates.
+
+```{r cleaning-checks}
+# 1. Brand names that might be spelling variants of one another (same first word).
+brand_first <- unique(d[,.(brand)])[,first_word:=sub(" .*","",brand)]
+brand_variants <- brand_first[,.(brands=.N,names=paste(sort(brand),collapse="; ")),by=first_word][brands>1]
+tab(brand_variants)
+# 2. Sites that change brand during the study (rebranding).
+site_brand <- unique(d[,.(site,date,brand)])[order(site,date)]
+site_brand[,switched:=brand!=shift(brand),by=site]
+switches <- site_brand[switched==TRUE]
+switch_month <- switches[,.(switches=.N),by=.(month_date=as.Date(format(date,"%Y-%m-01")))]
+multi_brand_sites <- uniqueN(switches$site)
+# 3. Which products exist in which year.
+product_years <- dcast(d[,.N,by=.(product,year)],product~year,value.var="N",fill=0)
+tab(product_years)
+# 4. Price precision and postcode format.
+format_checks <- data.table(
+  check=c("Prices with at most one decimal place","Postcodes matching 6xxx"),
+  share=c(mean(abs(d$price*10-round(d$price*10))<1e-6),mean(grepl("^6[0-9]{3}$",d$postcode))))
+tab(format_checks)
+# 5. Are extreme prices really concentrated in remote regions?
+extreme_region <- d[,.(records=.N,flagged_share=mean(extreme)),by=region][order(-flagged_share)]
+tab(extreme_region)
+ggplot(switch_month,aes(month_date,switches))+geom_col(fill="#167c80")+
+ labs(title="Brand changes at the same site, by month",
+      subtitle=sprintf("%d sites carry more than one brand during the study",multi_brand_sites),
+      x=NULL,y="Sites changing brand")
+```
+
+```{r cleaning-checks-text, results='asis'}
+top_extreme <- extreme_region[1:3]
+cat(sprintf("Brand names look consistent: %d first-word groups contain more than one brand, and these are separate brand labels rather than spelling variants (for example *%s*), so I did not merge any of them. ",
+ nrow(brand_variants),if (nrow(brand_variants)) brand_variants$names[1] else "none"))
+cat(sprintf("**%d sites change brand** at least once (%d brand changes in total). I keep the site key based on the address, so a rebranded station stays the same site, and the brand column always shows the brand on that day. This matters for the model, because a site's brand is not fixed over time.\n\n",
+ multi_brand_sites,nrow(switches)))
+cat(sprintf("%.1f%% of prices have at most one decimal place and %.1f%% of postcodes match the WA 6xxx format, so there are no unit or formatting errors hiding in the numbers. The product table shows that the set of fuels is not constant across years, which is one more reason to model a single product (ULP) only.\n\n",
+ 100*format_checks$share[1],100*format_checks$share[2]))
+cat(sprintf("Extreme-price flags are most common in %s (%.1f%%), %s (%.1f%%) and %s (%.1f%%), compared with %.1f%% in Metro. This supports keeping them: they come from remote areas, not from data errors.\n",
+ top_extreme$region[1],100*top_extreme$flagged_share[1],top_extreme$region[2],100*top_extreme$flagged_share[2],
+ top_extreme$region[3],100*top_extreme$flagged_share[3],100*extreme_region[region=="METRO",flagged_share]))
+```
+
+# Exploratory analysis
+
+Averages weight site-days equally, not litres sold. Product selection and
+modelling samples below are analytical subsets, separate from quality removals.
+
+```{r summaries}
+monthly <- d[,.(mean_price=mean(price),median_price=median(price),records=.N,sites=uniqueN(site)),
+              by=.(month_date,product,region)]
+daily <- d[,.(mean_price=mean(price),records=.N),by=.(date,product,region)]
+brand_month <- d[,.(mean_price=mean(price),records=.N),by=.(month_date,product,region,brand)]
+all_month <- d[,.(mean_price=mean(price),records=.N,sites=uniqueN(site)),by=.(month_date,product)]
+tab(d[,.(records=.N,sites=uniqueN(site),mean_price=mean(price),
+          median_price=median(price),sd_price=sd(price)),by=product])
+```
+
+```{r trends}
+ggplot(all_month,aes(month_date,mean_price,colour=product)) + geom_line(linewidth=.7) +
+ labs(title="Monthly average notified prices",subtitle="Computed from raw exports; not sales-weighted",
+      x=NULL,y="Price (cents/litre)",colour="Product")
+```
+
+Most products move together, which fits the idea that a shared wholesale cost
+drives them. The gap between them is fairly stable: LPG is clearly the cheapest
+(about 140 c/L on average), ULP sits around 185, and diesel, PULP and 98 RON
+cluster around 198–206. E85 is the odd one out: it is the most expensive and
+almost flat, but it only has 16 sites, so I would not draw conclusions from it.
+The most striking feature is the jump in March 2026, where ULP goes from about
+170 to 224 c/L in one month and diesel goes even higher in April. I come back to
+this in the price-shock section, because it matters for the training-data question.
+
+```{r coverage}
+coverage <- d[product=="ULP",.(sites=uniqueN(site),records=.N),by=month_date]
+ggplot(coverage,aes(month_date,sites)) + geom_line(colour="#167c80") + geom_point(size=1.3) +
+ labs(title="ULP site coverage over time",x=NULL,y="Observed sites")
+early_sites <- d[product=="ULP"&month_date==as.Date("2026-04-01"),unique(site)]
+late_sites <- d[product=="ULP"&month_date==as.Date("2026-05-01"),unique(site)]
+common_sites <- intersect(early_sites,late_sites)
+coverage_changes <- data.table(measure=c("April sites","May sites","Shared",
+                               "May only","April only"),
+ n=c(length(early_sites),length(late_sites),length(common_sites),
+     length(setdiff(late_sites,early_sites)),length(setdiff(early_sites,late_sites))))
+tab(coverage_changes)
+matched <- d[product=="ULP"&month_date %in% as.Date(c("2026-04-01","2026-05-01")),
+             .(mean_price=mean(price)),by=month_date]
+matched[,population:="All observed sites"]
+fixed <- d[product=="ULP"&site %in% common_sites&
+             month_date %in% as.Date(c("2026-04-01","2026-05-01")),
+           .(mean_price=mean(price)),by=month_date]
+fixed[,population:="Sites present in both months"]
+tab(rbind(matched,fixed))
+```
+
+Site coverage stays at roughly 700–750 ULP sites for most of the period, then
+jumps to about 950 in May 2026. Using `intersect()`/`setdiff()`, 748 sites are in
+both April and May, 198 appear only in May, and just 3 disappear. The newcomers
+are not a random sample: for the shared sites, the mean price falls from 211.6
+to 184.9 c/L, but for all sites it only falls to 193.2. So the new sites are
+noticeably more expensive, and a naive month-on-month average would understate
+the actual price drop. This is one reason I only compare like-for-like periods
+and use a relative (same-day, same-region) target later.
+
+These set operations identify changes in observed coverage, not proven business
+openings/closures. The common-site check helps separate composition from price
+changes but cannot establish causes.
+
+```{r regions}
+ggplot(monthly[product=="ULP"],aes(month_date,mean_price,colour=region))+
+ geom_line()+facet_wrap(~region,ncol=3)+guides(colour="none")+
+ labs(title="Regional ULP trends",x=NULL,y="Price (cents/litre)")
+```
+
+All regions follow the same broad up-and-down shape, but the level differs a
+lot. Over the whole period Metro is cheapest (about 181 c/L) and Peel and the
+South-West are close behind, while the Kimberley averages about 233 c/L, more
+than 50 c/L above Perth. Distance from the Kwinana refinery/terminal and
+thinner competition are the obvious explanations, although this data alone
+cannot prove that. Metro and Peel lines also look much "noisier", which led me
+to look at day-of-week patterns.
+
+```{r distributions}
+set.seed(params$seed)
+plot_sample <- d[sample.int(.N,min(.N,30000))]
+ggplot(plot_sample,aes(product,price,fill=product))+geom_boxplot(outlier.alpha=.08)+
+ guides(fill="none")+labs(title="Product price distributions",
+ subtitle="Seeded plotting sample; summary statistics use all records",
+ x=NULL,y="Price (cents/litre)")
+```
+
+The boxplots confirm the ordering from the trend chart, but they also show that
+diesel has the widest spread (SD about 32 c/L against about 22 for ULP) and the
+longest upper tail. Every product has a long upper tail and a fairly tight lower
+end. In other words, there is a floor set by wholesale cost and very little room
+to go below it, but remote sites can be far above it. This skew is one reason I
+used medians rather than means as the reference for "cheap".
+
+```{r ulp-histogram, fig.height=6}
+ulp_sample <- plot_sample[product=="ULP"]
+ulp_sample[,area_type:=ifelse(region %in% c("METRO","PEEL"),"Metro and Peel","Regional WA")]
+hist_plot <- ggplot(ulp_sample,aes(price))+
+ geom_histogram(aes(y=after_stat(density)),binwidth=5,fill="#167c80",colour="white")+
+ geom_density(colour="#c36b39",linewidth=.8)+facet_wrap(~area_type,ncol=1)+
+ labs(title="ULP price: histogram and density",x="Price (c/L)",y="Density")
+bar_plot <- ggplot(ulp_sample,aes(y=reorder(region,region,length)))+
+ geom_bar(fill="#5479a3")+
+ labs(title="ULP records by region (sample)",x="Records",y=NULL)
+gridExtra::grid.arrange(hist_plot,bar_plot,ncol=2)
+ulp_five <- boxplot.stats(d[product=="ULP",price])$stats
+names(ulp_five) <- c("lower whisker","Q1","median","Q3","upper whisker")
+tab(t(ulp_five),1)
+```
+
+Splitting the ULP histogram by area (with `grid.arrange()` from Lab 2) makes the
+skew easier to understand. Metro and Peel have a fairly compact distribution
+with a single main peak, while the regional histogram is wider and has a long
+right tail that the density curve picks up. The bar chart is a reminder that
+most records come from Metro, so a state-wide average is mostly a Perth
+average. `boxplot.stats()` gives the five numbers behind the ULP boxplot. The
+upper whisker sits at about `r round(ulp_five[5])` c/L, and everything above
+that is drawn as an outlier, even though these are real remote prices.
+
+```{r weekday}
+weekday_summary <- d[product=="ULP"&date<test_start,.(mean_price=mean(price)),by=.(region,weekday)]
+ggplot(weekday_summary,aes(weekday,mean_price,group=region,colour=region))+
+ geom_line()+geom_point()+facet_wrap(~region,ncol=3)+guides(colour="none")+
+ labs(title="Pre-test ULP weekday associations",subtitle="Associations do not prove a stable price cycle",
+ x=NULL,y="Price (cents/litre)")
+```
+
+This was the most interesting chart for me. Metro and Peel show a clear weekly
+price cycle: Tuesday is the cheapest day (about 169 c/L in Metro) and prices jump
+by roughly 27 c/L on Wednesday, then drift down over the following days. The
+Wheatbelt shows a weak version of the same pattern, while remote regions like
+the Kimberley and Gascoyne are essentially flat (they move by less than 0.5 c/L
+across the week). So the weekday effect is real but very local. It matters
+mainly in Perth and its surroundings, which is something a model should only
+pick up when combined with region.
+
+```{r year-comparison}
+# Base-R version of the same summary, using subset() and the native pipe.
+annual <- d |>
+  subset(product=="ULP" & month<=8,select=c(year,region,price)) |>
+  aggregate(price ~ year + region,data=_,FUN=mean) |>
+  setNames(c("year","region","mean_price"))
+ggplot(annual,aes(factor(year),mean_price,fill=region))+geom_col(position="dodge")+
+ labs(title="Comparable January–August periods in every year",
+ x="Year (January–August)",y="Price (cents/litre)",fill="Region")
+```
+
+Most of the report uses `data.table`, but for this chart and the brand chart
+below I used base R `subset()`, `aggregate()` and the native pipe `|>`, as
+suggested in the project brief; the results are identical either way.
+Comparing the same January–August window each year avoids comparing a full
+year with a part year. State-wide ULP averaged about 182.7 c/L in 2023, 189.1
+in 2024, 177.9 in 2025 and 193.7 in 2026. So 2025 was the cheapest year and
+2026 the most expensive, almost entirely because of the March–April spike. The
+ranking of regions barely changes from year to year, with Kimberley always on top
+and Metro always near the bottom, which suggests the regional structure is much
+more stable than the overall price level.
+
+The exploration moves from overall product differences to within-product region
+and weekday patterns. Coverage changes motivate the common-site check; product
+differences motivate ULP-only modelling. Test-month plots are descriptive and
+are not used to revise the prespecified features or tuning grid below.
+
+
+
+## Interpreting the observed patterns
+
+```{r eda-findings, results='asis'}
+ranks <- d[product=="ULP" & year==2026 & month<=8,
+           .(mean_price=mean(price)),by=region][order(mean_price)]
+current <- d[product=="ULP" & year==2026 & month<=8,mean(price)]
+previous <- d[product=="ULP" & year==2025 & month<=8,mean(price)]
+cat(sprintf("For January to August 2026, the mean ULP notified price is **%.1f c/L**, compared with **%.1f c/L** in the corresponding 2025 months (difference **%+.1f c/L**). These are record-weighted means, so changing site coverage remains a possible contributor.\n\n",
+ current,previous,current-previous))
+cat(sprintf("Across regions in January to August 2026, %s has the lowest mean ULP price (%.1f c/L), while %s has the highest (%.1f c/L). Regional comparisons should account for coverage and remoteness rather than treating these as brand effects.\n\n",
+ ranks$region[1],ranks$mean_price[1],tail(ranks$region,1),tail(ranks$mean_price,1)))
+cat(sprintf("Between April and May 2026, observed ULP sites change from **%d to %d**. There are **%d** shared site identifiers. The all-site and shared-site price comparisons above show how sensitive the apparent change is to population composition.\n",
+ length(early_sites),length(late_sites),length(common_sites)))
+```
+
+```{r brand-comparison}
+july_ulp <- subset(d,product=="ULP" & year==2026 & month==7,select=c(brand,price))
+brand_ulp <- merge(
+  aggregate(price ~ brand,data=july_ulp,FUN=mean) |> setNames(c("brand","mean_price")),
+  aggregate(price ~ brand,data=july_ulp,FUN=length) |> setNames(c("brand","records")),
+  by="brand")
+brand_ulp <- brand_ulp[order(-brand_ulp$records),] |> head(12)
+ggplot(brand_ulp,aes(reorder(brand,mean_price),mean_price))+
+ geom_col(fill="#167c80")+coord_flip()+
+ labs(title="ULP prices for the 12 most-observed brands in July 2026",
+ subtitle="Brand differences also reflect geography and station mix",
+ x=NULL,y="Mean notified price (c/L)")
+```
+
+In July 2026 the cheapest large brands are Atlas, Vibe, United and 7-Eleven
+(around 170–175 c/L), while BP (about 199) and Independent (about 216) are the
+most expensive. I would be careful with this, though: "Independent" covers many
+small rural stations, and BP has a large regional network, so part of this gap
+is geography rather than brand pricing policy. Even so, the gap between brands
+(more than 40 c/L) is much bigger than the weekday effect, which made brand my
+first guess for the strongest single predictor.
+
+## The March 2026 price shock
+
+```{r price-shock}
+shock <- d[product=="ULP" & date>=as.Date("2025-09-01")]
+shock[,reference:=median(price),by=.(date,region)]
+shock_daily <- shock[,.(mean_price=mean(price)),by=date]
+top <- max(shock_daily$mean_price)
+ggplot(shock_daily,aes(date,mean_price))+
+ annotate("rect",xmin=as.Date("2026-03-01"),xmax=as.Date("2026-04-30"),
+          ymin=-Inf,ymax=Inf,fill="#c36b39",alpha=.15)+
+ annotate("rect",xmin=as.Date("2026-05-01"),xmax=as.Date("2026-07-31"),
+          ymin=-Inf,ymax=Inf,fill="#167c80",alpha=.12)+
+ annotate("rect",xmin=test_start,xmax=end_date,ymin=-Inf,ymax=Inf,fill="grey50",alpha=.15)+
+ geom_line(colour="#173d50",linewidth=.5)+
+ annotate("text",x=as.Date("2026-03-31"),y=top+4,label="Price shock\nMar-Apr",size=3.3)+
+ annotate("text",x=as.Date("2026-06-15"),y=top+4,label="Recent training\nMay-Jul",size=3.3)+
+ annotate("text",x=as.Date("2026-08-16"),y=top+4,label="Test\nAug",size=3.3)+
+ labs(title="Daily state-wide ULP average, September 2025 to August 2026",
+      subtitle="Shaded windows show the shock, the recent training months and the test month",
+      x=NULL,y="Price (c/L)")
+shock_month <- shock[,.(mean_price=mean(price),within_day_sd=sd(price-reference),
+                        cheap_fraction=mean(price<reference)),by=month_date][order(month_date)]
+site_month_rate <- shock[,.(cheap_rate=mean(price<reference)),by=.(site,month_date)]
+rate_wide <- dcast(site_month_rate,site~month_date,value.var="cheap_rate")
+shock_months <- sort(unique(site_month_rate$month_date))
+# Spearman correlation of each site's monthly cheap rate with the previous month.
+shock_month[,rank_corr_prev:=c(NA_real_,mapply(function(a,b)
+  cor(rate_wide[[as.character(a)]],rate_wide[[as.character(b)]],
+      use="complete.obs",method="spearman"),head(shock_months,-1),shock_months[-1]))]
+tab(shock_month)
+```
+
+From September 2025 to February 2026 the state-wide ULP average sits in a narrow
+170–179 c/L band. Then in March 2026 it jumps to about 224 c/L, a rise of
+roughly a third in a single month, and diesel peaks even higher in April. News
+reports at the time linked this to the war involving Iran and its effect on
+crude oil supply ([ABC News, 10 March 2026](https://www.abc.net.au/news/2026-03-10/why-fuel-prices-are-going-up-australia/106437844)).
+The federal government then halved fuel excise for three months from April,
+a cut of about 26 c/L ([Reuters, 30 March 2026](https://www.reuters.com/business/energy/australia-halve-tax-petrol-bring-down-costs-wake-iran-war-2026-03-30/)),
+which fits the dip from April to June and the rebound once it ran out.
+FuelWatch data cannot test these explanations, so I treat them as context, not
+as findings. Prices eased back to about 180 by June, then climbed again to about
+211 in August, the test month.
+
+**Does the shock make the experiment less objective?** This was my main worry,
+so I checked three things in the table above:
+
+1. *The label stays balanced.* Because "cheap" is defined against the same-day,
+   same-region median, a price rise that hits every station equally does not
+   change anyone's label. The cheap fraction stays between 0.42 and 0.45 in every
+   month, including March and April. If I had used a fixed threshold (say,
+   "below 180 c/L"), almost every August 2026 record would be "expensive" and
+   the experiment would be meaningless.
+2. *But the ranking of stations is disturbed.* The rank correlation of each
+   site's cheap rate with the previous month is usually around 0.83–0.90, but it
+   drops to 0.67 in March and 0.62 in April. During the shock, stations did not
+   pass on the increase at the same speed, so which stations count as cheap got
+   reshuffled for a while. It recovers to 0.84 by August. This matches reporting
+   at the time that the oil shock had reshaped the usual petrol price cycle
+   ([ABC News, 31 March 2026](https://www.abc.net.au/news/2026-03-31/petrol-prices-accc-shape-market/106504912)).
+3. *The spread within each day roughly doubles from May.* Within-day SD goes
+   from about 10 to 20–24 c/L. Part of this is the 198 extra (mostly regional)
+   sites that appear from May, and part is the shock itself.
+
+So the comparison is still fair, since both strategies are tested on exactly
+the same August 2026 records with the same label rule. However, the shock is a
+genuine distribution shift between the historical Augusts and the 2026 test
+month, and I discuss it as part of the training-data comparison rather than
+ignoring it.
+
+# Binary classification design
+
+## Target and leakage prevention
+
+For ULP only, **cheap** means strictly below the median price for that date and
+region. Ties are **expensive** (at or above the reference), so the classes need
+not be balanced. This asks about relative local affordability, not historically
+low absolute prices. It dampens common price-level shocks without proving the
+absence of structural change.
+
+The contemporaneous regional median is used only to construct the outcome after
+prices are observed. It is not known in advance and never enters predictors.
+This is a retrospective evaluation of predicting relative affordability from
+calendar and site attributes; it does not predict a numerical fuel price.
+
+The candidate predictors are brand, region, weekday, day-of-month and one
+engineered feature, **site history** (`site_rate`). Exclude price, median,
+price differences, raw site/name/address identifiers, postcode, locality and
+area. The latter duplicate geography or are high-cardinality.
+Absolute year/date is excluded to avoid unhelpful time extrapolation.
+
+Brand alone is a coarse summary: two BP stations can behave very differently.
+Site history is the share of a station's *training* records that were cheap,
+smoothed as (cheap + 1) / (records + 2) so that a site seen only a few times is
+pulled towards 0.5. This is the Lab 7 `mkPredC()` idea of turning a
+categorical variable with thousands of levels into a single probability column.
+To avoid leakage: (1) it is learnt only from the training rows of each strategy,
+never from the test month; (2) for training rows themselves it is computed
+out-of-fold, using five folds of whole dates, so a record's own label never
+feeds its own feature; (3) a site that never appears in training gets the
+overall training cheap rate.
+
+```{r target}
+ulp <- copy(d[product=="ULP"])
+ulp[,":="(reference=median(price),reference_n=.N),by=.(date,region)]
+ulp[,target:=factor(ifelse(price<reference,"cheap","expensive"),levels=c("expensive","cheap"))]
+ulp[,relative_price:=price-reference]
+model_data <- ulp[reference_n>=5 & region!="UNKNOWN"]
+scope_audit <- data.table(population=c("Clean all-product rows","ULP rows",
+                                       "ULP with region reference of >=5 sites"),
+                          rows=c(nrow(d),nrow(ulp),nrow(model_data)))
+tab(scope_audit)
+tab(model_data[,.(n=.N,cheap_fraction=mean(target=="cheap"),
+                  ties=mean(price==reference)),by=year])
+```
+
+Reference groups with fewer than five sites or missing region are excluded only
+from modelling, not removed from cleaned EDA. No target-price imputation occurs.
+
+## How the target relates to the candidate features
+
+Before modelling I looked at the target against each feature with the bar
+charts from Lab 4. Only pre-test dates are used, so the August 2026 test month
+does not influence the choice of features.
+
+```{r target-eda}
+pre_test <- model_data[date<test_start]
+top_brands <- pre_test[,.N,by=brand][order(-N)][1:12,brand]
+ggplot(pre_test[brand %in% top_brands],
+       aes(y=reorder(brand,target=="cheap",FUN=mean),fill=target))+
+ geom_bar(position="fill")+geom_vline(xintercept=.5,linetype=2)+
+ scale_fill_manual(values=c(expensive="#c36b39",cheap="#167c80"))+
+ labs(title="Share of cheap records by brand (filled bar chart)",
+      subtitle="Pre-test ULP records; dashed line marks 50%",x="Share",y=NULL,fill="Target")
+metro_brands <- c("BP","AMPOL","7-ELEVEN","CALTEX","VIBE","REDDY EXPRESS")
+ggplot(pre_test[region=="METRO" & brand %in% metro_brands],aes(weekday,fill=target))+
+ geom_bar(position="fill")+facet_wrap(~brand,ncol=3)+
+ scale_fill_manual(values=c(expensive="#c36b39",cheap="#167c80"))+
+ labs(title="Metro: cheap share by weekday for six large brands",
+      subtitle="The weekday effect differs by brand: an interaction a single variable cannot show",
+      x=NULL,y="Share",fill="Target")
+target_brand <- pre_test[,.N,by=.(brand,region,weekday,target)]
+```
+
+The first chart shows why brand is such a strong single predictor. Vibe, United
+and Liberty records are cheap about 75–80% of the time, while BP, Caltex and
+Independent records are cheap only about 25–28% of the time. Weekday on its own
+cannot work in the same way. Because the label compares each station with the
+median *of the same day and region*, the cheap share is almost the same on every
+weekday by construction (between 0.43 and 0.45).
+
+The second chart shows where weekday still matters. In Metro, 7-Eleven is cheap
+on 55% of Tuesdays but only 21% of Wednesdays, which fits it being one of the
+first to raise prices at the start of the cycle. BP shows almost the opposite
+pattern (11% on Mondays, 36% on Wednesdays), because it raises later and is
+briefly cheaper than the stations that have already gone up. Vibe is cheap
+almost every day, and Ampol barely changes. So the effect of weekday depends on
+the brand. That is an interaction a single-variable model cannot capture, and I
+expect models that combine features to gain something over brand alone.
+
+## Training, calibration and final test
+
+- Historical: August 2023, August 2024, August 2025.
+- Recent: May, June, July 2026.
+- In each source month, a seeded random quarter of the calendar dates forms the
+  calibration pool and the remaining dates form the training pool. Splitting by
+  whole dates keeps the same regional/day labels in one split, and sampling dates
+  across the whole month means calibration covers every part of the month. (An
+  earlier version used days 1–24 versus 25–end; calibration then only contained
+  days the training bins had never seen, so day-of-month could not be evaluated.)
+- Both strategies use the same number of training rows and the same number of
+  calibration rows. Each is the size of the smaller pool, so one strategy is
+  randomly (seeded) cut down to match the other. The single-variable models,
+  Naïve Bayes and the site-history feature use **all** of these training rows.
+  The SVM is trained on a seeded subsample of 4,000 of them, because a radial SVM
+  with probability estimates scales roughly quadratically with the number of
+  rows. A size check later in the report shows what this costs.
+- The entire eligible August 2026 test set is held out. Do not retune using it.
+
+Calibration here is a validation set for selecting features/hyperparameters,
+not a separate probability-calibration procedure. Historical validation reflects
+historical periods, whereas recent validation reflects recent periods: this is
+part of the distribution-shift limitation. Sites can recur across periods; the
+question concerns future records, not generalisation to entirely unseen sites.
+
+```{r split}
+pools <- list(
+ Historical=model_data[month==8 & year %in% 2023:2025],
+ Recent=model_data[year==2026 & month %in% 5:7])
+test <- model_data[date>=test_start & date<=end_date]
+if (uniqueN(test$target)!=2L) stop("Test set needs both classes.")
+# Pick calibration dates once per pool: a random quarter of the dates in each source month.
+cal_dates <- lapply(seq_along(pools),function(i) {
+  set.seed(params$seed+i)
+  month_dates <- unique(pools[[i]][,.(date,year,month)])
+  month_dates[,.(date=date[sample.int(.N,round(.N/4))]),by=.(year,month)]$date
+})
+n_train <- min(params$train_cap, vapply(seq_along(pools),
+  function(i) sum(!pools[[i]]$date %in% cal_dates[[i]]),integer(1)))
+n_cal <- min(params$calibration_cap, vapply(seq_along(pools),
+  function(i) sum(pools[[i]]$date %in% cal_dates[[i]]),integer(1)))
+if (min(n_train,n_cal)<100) stop("Too few rows for the planned experiment.")
+splits <- lapply(seq_along(pools),function(i) {
+  set.seed(params$seed+i)
+  x <- pools[[i]]
+  train <- x[!date %in% cal_dates[[i]]]; cal <- x[date %in% cal_dates[[i]]]
+  train <- train[sample.int(.N,n_train)]
+  cal <- cal[sample.int(.N,n_cal)]
+  stopifnot(!length(intersect(train$date,cal$date)),
+            max(c(train$date,cal$date))<test_start)
+  list(train=train,cal=cal,svm_rows=sort(sample.int(nrow(train),min(params$svm_cap,nrow(train)))))
+})
+names(splits) <- names(pools)
+split_audit <- rbindlist(lapply(names(splits),function(s) {
+  rbindlist(lapply(c("train","cal"),function(part) {
+    x <- splits[[s]][[part]]
+    data.table(strategy=s,split=part,n=nrow(x),first=min(x$date),last=max(x$date),
+               cheap_fraction=mean(x$target=="cheap"),sites=uniqueN(x$site))
+  }))
+}))
+tab(split_audit)
+tab(test[,.(records=.N,first=min(date),last=max(date),cheap_fraction=mean(target=="cheap"))])
+```
+
+## Reusable functions and preprocessing
+
+Rare categorical levels (<20 training observations) and unseen levels map to
+OTHER, using training data alone. Conditional-probability baselines and Naïve
+Bayes use training-decile bins for day-of-month, following `mkPredN()` from Lab 7,
+and the single-variable models are smoothed pivot tables in the spirit of
+`mkPredC()`. AUC uses the Lab 7 `calcAUC()` (ROCR), and the Lab 7 `logLikelihood()`
+gives the deviance used for variable selection. SVM uses one-hot categorical
+columns and training-standardised numeric day and site history. Constant training columns are
+removed. No mean, scale, category map or bin boundary is fitted on test data.
+
+```{r model-functions}
+# Positive class is cheap. Undefined rates return NA instead of a fictitious zero.
+safe_div <- function(a,b) if (b==0) NA_real_ else a/b
+# calcAUC() and logLikelihood() follow Lab 7. ytrue is TRUE/FALSE, ypred a probability.
+calcAUC <- function(ypred,ytrue) {
+  if (length(unique(ytrue))<2) return(NA_real_)
+  perf <- ROCR::performance(ROCR::prediction(ypred,ytrue),"auc")
+  as.numeric(perf@y.values)
+}
+logLikelihood <- function(ypred,ytrue) {
+  sum(ifelse(ytrue,log(ypred),log(1-ypred)),na.rm=TRUE)
+}
+auc_cheap <- function(y,p) calcAUC(p,y=="cheap")
+metrics <- function(y,p,threshold=.5) {
+  if (length(y)!=length(p)||any(!is.finite(p))) stop("Invalid prediction vector.")
+  truth <- y=="cheap"; pred <- p>=threshold
+  tp<-sum(truth&pred); tn<-sum(!truth&!pred)
+  fp<-sum(!truth&pred); fn<-sum(truth&!pred)
+  data.table(n=length(y),TP=tp,TN=tn,FP=fp,FN=fn,
+    Accuracy=(tp+tn)/length(y),Precision=safe_div(tp,tp+fp),
+    Recall=safe_div(tp,tp+fn),Specificity=safe_div(tn,tn+fp),
+    F1=safe_div(2*tp,2*tp+fp+fn),
+    Balanced_accuracy=mean(c(safe_div(tp,tp+fn),safe_div(tn,tn+fp))),
+    AUC=auc_cheap(y,p))
+}
+# Training-only transformations, including defensible handling of new levels.
+fit_preprocessor <- function(x) {
+  keep <- lapply(c("brand","region","weekday"),function(nm) {
+    freq <- table(as.character(x[[nm]]))
+    names(freq)[freq>=20]
+  })
+  names(keep) <- c("brand","region","weekday")
+  # Numeric features: decile cut points (as in mkPredN() from Lab 7) and Z-scaling.
+  num <- lapply(intersect(c("day","site_rate"),names(x)),function(nm) {
+    v <- x[[nm]]
+    list(breaks=unique(c(-Inf,as.numeric(quantile(v,seq(.1,.9,.1))),Inf)),
+         centre=mean(v),scale=max(sd(v),1e-8))
+  })
+  names(num) <- intersect(c("day","site_rate"),names(x))
+  list(keep=keep,num=num)
+}
+transform_categories <- function(x,pp) {
+  out <- lapply(names(pp$keep),function(nm) {
+    z <- as.character(x[[nm]])
+    z[!z %in% pp$keep[[nm]]] <- "OTHER"
+    factor(z,levels=unique(c(pp$keep[[nm]],"OTHER")))
+  })
+  names(out) <- names(pp$keep)
+  for (nm in intersect(names(pp$num),names(x))) {
+    out[[nm]] <- cut(x[[nm]],breaks=pp$num[[nm]]$breaks,include.lowest=TRUE)
+  }
+  as.data.frame(out)
+}
+svm_matrix <- function(x,pp,features) {
+  categories <- transform_categories(x,pp)
+  pieces <- lapply(features,function(nm) {
+    if (nm %in% names(pp$num)) {
+      z <- matrix((x[[nm]]-pp$num[[nm]]$centre)/pp$num[[nm]]$scale,ncol=1)
+      colnames(z) <- paste0(nm,"_z"); return(z)
+    }
+    z <- matrix(vapply(levels(categories[[nm]]),function(lv)
+      as.numeric(categories[[nm]]==lv),numeric(nrow(x))),nrow=nrow(x))
+    colnames(z)<-paste(nm,levels(categories[[nm]]),sep="_")
+    z
+  })
+  do.call(cbind,pieces)
+}
+# Laplace-smoothed pivot-table conditional probabilities; unknowns use prior.
+fit_single <- function(x,y) {
+  counts <- data.table(level=as.character(x),positive=as.integer(y=="cheap"))[
+    ,.(p=(sum(positive)+1)/(.N+2)),by=level]
+  list(p=setNames(counts$p,counts$level),prior=mean(y=="cheap"))
+}
+predict_single <- function(model,x) {
+  p <- unname(model$p[as.character(x)])
+  p[is.na(p)]<-model$prior
+  p
+}
+# Site history: smoothed share of cheap records per site, learnt from training rows only.
+# Sites never seen in training get the training prior.
+site_rate_lookup <- function(x,history,prior) {
+  counts <- history[,.(k=sum(target=="cheap"),n=.N),by=site]
+  m <- counts[match(x$site,counts$site)]
+  ifelse(is.na(m$n),prior,(m$k+1)/(m$n+2))
+}
+# Training rows get out-of-fold values (folds of whole dates), so a row's own label
+# never feeds its own feature; calibration and test rows use all training rows.
+encode_site <- function(train,others,seed,folds=5) {
+  if (!all(c("site","date","target") %in% names(train))) stop("encode_site needs site, date, target.")
+  prior <- mean(train$target=="cheap")
+  set.seed(seed)
+  dates <- sort(unique(train$date))
+  fold_of_date <- sample(rep_len(seq_len(folds),length(dates)))
+  fold <- fold_of_date[match(train$date,dates)]
+  train_rate <- numeric(nrow(train))
+  for (k in seq_len(folds)) {
+    idx <- which(fold==k)
+    train_rate[idx] <- site_rate_lookup(train[idx],train[-idx],prior)
+  }
+  list(train=train_rate,others=lapply(others,site_rate_lookup,history=train,prior=prior))
+}
+# One fitted NB/SVM object; it owns the transformation fitted on its training data.
+fit_classifier <- function(train,pp,features,method,cost=1,gamma=NULL) {
+  if (uniqueN(train$target)!=2) stop("Both target classes needed.")
+  if (method=="NB") {
+    xx <- transform_categories(train,pp)[,features,drop=FALSE]
+    fit <- e1071::naiveBayes(x=xx,y=train$target,laplace=1)
+    return(structure(list(fit=fit,pp=pp,features=features,method=method),
+                     class="fuel_classifier"))
+  }
+  xx <- svm_matrix(train,pp,features)
+  active <- apply(xx,2,sd)>1e-8
+  xx <- xx[,active,drop=FALSE]
+  if (!ncol(xx)) stop("No varying SVM features.")
+  if (is.null(gamma)) gamma <- 1/ncol(xx)
+  fit <- e1071::svm(x=xx,y=train$target,kernel="radial",cost=cost,
+                     gamma=gamma,scale=FALSE,probability=TRUE,cachesize=200)
+  structure(list(fit=fit,pp=pp,features=features,method=method,active=active),
+            class="fuel_classifier")
+}
+predict_classifier <- function(model,x) {
+  if (model$method=="NB") {
+    xx <- transform_categories(x,model$pp)[,model$features,drop=FALSE]
+    return(as.numeric(predict(model$fit,xx,type="raw")[,"cheap"]))
+  }
+  xx <- svm_matrix(x,model$pp,model$features)[,model$active,drop=FALSE]
+  ans <- predict(model$fit,xx,probability=TRUE)
+  as.numeric(attr(ans,"probabilities")[,"cheap"])
+}
+```
+
+## Feature selection and tuning
+
+The primary selection metric is calibration AUC: ranking relatively cheap
+records matters, and AUC is threshold-independent. Report F1 and balanced
+accuracy at the fixed 0.5 probability cutoff alongside accuracy. A null model
+predicts the majority class; its constant score has AUC 0.5.
+
+For each strategy, rank five single-variable models on calibration AUC, and also
+compute each one's deviance reduction against the null model on calibration,
+`2 × (logLik(model) − logLik(null))`, as in Lab 7. Three candidate feature sets
+are compared in NB and SVM: the top two by AUC, all five, and the Lab 7 rule,
+i.e. every variable whose deviance reduction is at least 10 (duplicate sets are
+dropped). Tune SVM cost (0.5, 2) and
+gamma (1/p, 2/p), with p the number of active input columns. Select using
+calibration AUC only. The modest fixed grid and the 4,000-row SVM subsample are
+computational trade-offs, not claims of globally optimal tuning. The main models
+keep the natural class balance; two imbalance treatments are compared separately
+after the main results.
+
+```{r training}
+min_drop <- 10
+results <- list(); single_tables <- list(); tune_tables <- list()
+predictions <- list(); roc_tables <- list(); selected <- list(); fitted_models <- list()
+encoded <- list()
+for (strategy in names(splits)) {
+  train <- copy(splits[[strategy]]$train)
+  cal <- copy(splits[[strategy]]$cal)
+  test_s <- copy(test)
+  enc <- encode_site(train,list(cal=cal,test=test_s),seed=params$seed+50)
+  train[,site_rate:=enc$train]; cal[,site_rate:=enc$others$cal]; test_s[,site_rate:=enc$others$test]
+  svm_train <- train[splits[[strategy]]$svm_rows]
+  encoded[[strategy]] <- list(train=train,cal=cal,test=test_s,svm_train=svm_train)
+  pp <- fit_preprocessor(train)
+  trcat <- transform_categories(train,pp)
+  cacat <- transform_categories(cal,pp)
+  features <- c("brand","region","weekday","day","site_rate")
+  singles <- setNames(lapply(features,function(f) fit_single(trcat[[f]],train$target)),features)
+  # Null-model log likelihood on calibration, as in Lab 7.
+  logNull <- logLikelihood(mean(cal$target=="cheap"),cal$target=="cheap")
+  ranking <- rbindlist(lapply(features,function(f) {
+    p <- predict_single(singles[[f]],cacat[[f]])
+    data.table(feature=f,AUC=auc_cheap(cal$target,p),
+               deviance_reduction=2*(logLikelihood(p,cal$target=="cheap")-logNull))
+  }))
+  setorder(ranking,-AUC,feature)
+  ranking[,strategy:=strategy]
+  single_tables[[strategy]] <- ranking
+  best_single <- ranking$feature[1]
+  dev_selected <- ranking[deviance_reduction>=min_drop,feature]
+  if (!length(dev_selected)) dev_selected <- best_single
+  feature_sets <- list(Top2=ranking$feature[1:2],All=features,DevDrop=dev_selected)
+  feature_sets <- feature_sets[!duplicated(lapply(feature_sets,sort))]
+  candidates <- list(); score_rows <- list(); counter <- 0L
+  for (set_name in names(feature_sets)) {
+    fs <- feature_sets[[set_name]]
+    counter <- counter+1L
+    nb <- fit_classifier(train,pp,fs,"NB")
+    candidates[[counter]] <- nb
+    score_rows[[counter]] <- data.table(id=counter,method="NB",feature_set=set_name,
+      features=paste(fs,collapse=" + "),cost=NA_real_,gamma=NA_real_,
+      AUC=auc_cheap(cal$target,predict_classifier(nb,cal)))
+    xx <- svm_matrix(svm_train,pp,fs)
+    p <- sum(apply(xx,2,sd)>1e-8)
+    for (cost in c(.5,2)) for (mult in c(1,2)) {
+      counter <- counter+1L
+      set.seed(params$seed+counter)
+      svm <- fit_classifier(svm_train,pp,fs,"SVM",cost=cost,gamma=mult/p)
+      candidates[[counter]] <- svm
+      score_rows[[counter]] <- data.table(id=counter,method="SVM",feature_set=set_name,
+        features=paste(fs,collapse=" + "),cost=cost,gamma=mult/p,
+        AUC=auc_cheap(cal$target,predict_classifier(svm,cal)))
+    }
+  }
+  tuning <- rbindlist(score_rows)
+  tuning[,strategy:=strategy]
+  tune_tables[[strategy]] <- tuning
+  nb_id <- tuning[method=="NB"][which.max(AUC),id]
+  svm_id <- tuning[method=="SVM"][which.max(AUC),id]
+  winners <- candidates[c(nb_id,svm_id)]
+  names(winners) <- c("NB","SVM")
+  selected[[strategy]] <- tuning[id %in% c(nb_id,svm_id)]
+  fitted_models[[strategy]] <- list(models=winners,singles=singles,best_single=best_single,pp=pp)
+  for (split_name in c("Train","Calibration","Test")) {
+    x <- switch(split_name,Train=train,Calibration=cal,Test=test_s)
+    probs <- list(Null=rep(mean(train$target=="cheap"),nrow(x)),
+      Single=predict_single(singles[[best_single]],transform_categories(x,pp)[[best_single]]),
+      NB=predict_classifier(winners$NB,x),SVM=predict_classifier(winners$SVM,x))
+    for (method in names(probs)) {
+      p_hat <- probs[[method]]
+      met <- metrics(x$target,p_hat)
+      met[,":="(strategy=strategy,split=split_name,model=method)]
+      results[[length(results)+1L]] <- met
+      if (split_name=="Test") {
+        predictions[[paste(strategy,method)]] <- data.table(strategy=strategy,model=method,
+          row=seq_len(nrow(x)),date=x$date,site=x$site,truth=x$target,probability=p_hat)
+        ro <- pROC::roc(x$target,p_hat,levels=c("expensive","cheap"),direction="<",quiet=TRUE)
+        roc_tables[[paste(strategy,method)]] <- data.table(strategy=strategy,model=method,
+          FPR=1-ro$specificities,TPR=ro$sensitivities)
+      }
+    }
+  }
+}
+evaluation <- rbindlist(results)
+single_scores <- rbindlist(single_tables)
+tuning_scores <- rbindlist(tune_tables)
+selected_models <- rbindlist(selected)
+test_predictions <- rbindlist(predictions)
+roc_data <- rbindlist(roc_tables)
+tab(single_scores)
+tab(selected_models[,.(strategy,method,feature_set,features,cost,gamma,calibration_AUC=AUC)])
+```
+
+```{r model-evaluation}
+tab(evaluation[,.(strategy,split,model,n,Accuracy,Precision,Recall,Specificity,F1,Balanced_accuracy,AUC)])
+tab(evaluation[split=="Test",.(strategy,model,TP,FP,FN,TN)])
+ggplot(roc_data,aes(FPR,TPR,colour=model)) + geom_line(linewidth=.8) +
+ geom_abline(slope=1,intercept=0,linetype=2,colour="grey60")+
+ facet_wrap(~strategy)+coord_equal()+
+ labs(title="Final August 2026 ROC curves",subtitle="Cheap is the positive class",
+      x="False-positive rate",y="True-positive rate",colour="Model")
+```
+
+```{r feature-comparison}
+ggplot(tuning_scores,aes(feature_set,AUC,colour=method))+
+ geom_point(position=position_jitter(width=.08,height=0,seed=params$seed),size=2)+
+ facet_wrap(~strategy)+labs(title="Feature combinations: calibration performance",
+ x="Feature subset",y="Calibration AUC")
+```
+
+## Class imbalance treatment
+
+About 45% of records are cheap, so the imbalance is mild, but it still matters at
+the 0.5 cut-off: models lean towards "expensive" and miss cheap records. I tried
+two treatments. Both are decided without looking at the test month:
+
+1. **Random oversampling** of cheap records in the training rows only, so that
+   the classes are 50/50. Calibration and test are never resampled. For SVM the
+   training size is kept at the same 4,000 rows.
+2. **Moving the cut-off.** Keep the model, but instead of 0.5 use the probability
+   threshold that maximises F1 on the calibration set.
+
+```{r imbalance}
+best_threshold <- function(y,p) {
+  grid <- seq(.2,.8,by=.01)
+  f1 <- vapply(grid,function(t) metrics(y,p,t)$F1,numeric(1))
+  grid[which.max(f1)]
+}
+oversample <- function(x,seed) {
+  set.seed(seed)
+  cheap <- x[target=="cheap"]; dear <- x[target=="expensive"]
+  rbind(dear,cheap[sample.int(.N,nrow(dear),replace=TRUE)])
+}
+imbalance_rows <- list()
+for (strategy in names(encoded)) {
+  e <- encoded[[strategy]]; models <- fitted_models[[strategy]]$models
+  for (m in c("NB","SVM")) {
+    base <- models[[m]]
+    p_cal <- predict_classifier(base,e$cal); p_test <- predict_classifier(base,e$test)
+    t_star <- best_threshold(e$cal$target,p_cal)
+    src <- if (m=="SVM") e$svm_train else e$train
+    os <- oversample(src,params$seed+70)
+    if (m=="SVM") os <- os[sample.int(.N,nrow(src))]
+    refit <- fit_classifier(os,base$pp,base$features,m,
+                            cost=if (m=="SVM") base$fit$cost else 1,
+                            gamma=if (m=="SVM") base$fit$gamma else NULL)
+    p_os <- predict_classifier(refit,e$test)
+    imbalance_rows[[length(imbalance_rows)+1L]] <- rbind(
+      metrics(e$test$target,p_test)[,treatment:="None (cut-off 0.5)"],
+      metrics(e$test$target,p_test,t_star)[,treatment:=sprintf("Cut-off tuned on calibration (%.2f)",t_star)],
+      metrics(e$test$target,p_os)[,treatment:="Oversampled training (cut-off 0.5)"]
+    )[,":="(strategy=strategy,model=m)]
+  }
+}
+imbalance <- rbindlist(imbalance_rows)
+tab(imbalance[,.(strategy,model,treatment,Precision,Recall,F1,Balanced_accuracy,AUC)])
+imbalance_long <- melt(imbalance[,.(strategy,model,treatment=sub(" \\(.*","",treatment),
+                                    Precision,Recall,F1)],
+                       id.vars=c("strategy","model","treatment"))
+ggplot(imbalance_long,aes(variable,value,fill=treatment))+geom_col(position="dodge")+
+ facet_grid(model~strategy)+coord_cartesian(ylim=c(0,1))+
+ scale_fill_manual(values=c("#9fb8c2","#167c80","#c36b39"))+
+ labs(title="Imbalance treatments on the August 2026 test",
+      subtitle="Treatments trade precision for recall; AUC (ranking) is almost unchanged",
+      x=NULL,y="Score",fill=NULL)
+```
+
+Moving the cut-off has the bigger effect. The F1-best threshold found on
+calibration is well below 0.5 (0.26–0.33), and on the test it raises F1 in all
+four cases, for example from 0.737 to 0.746 for the recent SVM and from 0.613 to
+0.643 for the historical SVM. It does this by finding many more cheap records
+(recall up by 0.06–0.25) while recommending more stations that turn out to be
+expensive (precision down by 0.05–0.17). For the historical models the drop in
+precision is large, and balanced accuracy actually falls (0.684 to 0.639 for
+SVM), so the cut-off that suited past Augusts is too aggressive for 2026.
+Oversampling gives smaller and more even gains (F1 up by 0.005–0.016). As
+expected, AUC hardly changes with either treatment, because neither changes how
+the model *ranks* stations. So the choice depends on the user: someone who
+wants to find as many cheap stations as possible should use a lower cut-off;
+someone who hates driving to an expensive one should keep 0.5.
+
+## Does training on more rows help?
+
+The SVM only sees 4,000 training rows. To check what this costs, I refitted the
+selected recent-strategy NB and SVM on growing random subsets of the training
+rows and scored them on the **calibration** set, so the test month stays untouched.
+The SVM stops at 8,000 rows because fitting time grows quickly.
+
+```{r training-size}
+e <- encoded$Recent; base <- fitted_models$Recent$models
+set.seed(params$seed+80)
+row_order <- sample.int(nrow(e$train))
+size_grid <- sort(unique(pmin(c(1000,2000,4000,8000,nrow(e$train)),nrow(e$train))))
+size_scores <- rbindlist(lapply(size_grid,function(n) {
+  sub <- e$train[row_order[seq_len(n)]]
+  nb <- fit_classifier(sub,base$NB$pp,base$NB$features,"NB")
+  out <- data.table(rows=n,model="NB",calibration_AUC=auc_cheap(e$cal$target,predict_classifier(nb,e$cal)),
+                    fit_seconds=NA_real_)
+  if (n<=8000) {
+    t0 <- Sys.time()
+    svm <- fit_classifier(sub,base$SVM$pp,base$SVM$features,"SVM",
+                          cost=base$SVM$fit$cost,gamma=base$SVM$fit$gamma)
+    secs <- as.numeric(difftime(Sys.time(),t0,units="secs"))
+    out <- rbind(out,data.table(rows=n,model="SVM",
+      calibration_AUC=auc_cheap(e$cal$target,predict_classifier(svm,e$cal)),fit_seconds=secs))
+  }
+  out
+}))
+tab(size_scores)
+ggplot(size_scores,aes(rows,calibration_AUC,colour=model))+geom_line()+geom_point(size=2)+
+ scale_x_log10(labels=scales::comma)+
+ labs(title="Calibration AUC against number of training rows (recent strategy)",
+      x="Training rows (log scale)",y="Calibration AUC",colour="Model")
+```
+
+The curve is almost flat. NB improves only from 0.907 with 1,000 rows to 0.914
+with all 49,448, and the SVM is already at 0.914 with 1,000 rows. It peaks at
+4,000 rows (0.917) and is slightly lower at 8,000 (0.915), while fitting time
+roughly quadruples each time the rows double (last column). So training the SVM on 4,000 rows costs
+essentially nothing in accuracy here. Most of the information is in the site
+history, which is computed from all training rows anyway.
+
+### Reading the results
+
+```{r findings, results='asis'}
+for (s in names(splits)) {
+  z <- evaluation[strategy==s & split=="Test"]
+  baseline <- max(z[model %in% c("Null","Single"),AUC])
+  cat(sprintf("\n**%s training:** null AUC %.3f; best single-variable AUC %.3f; NB %.3f; SVM %.3f.\n\n",
+      s,z[model=="Null",AUC],z[model=="Single",AUC],z[model=="NB",AUC],z[model=="SVM",AUC]))
+  for (m in c("NB","SVM")) {
+    delta <- z[model==m,AUC]-baseline
+    cat(sprintf("- %s %s the stronger baseline by %.3f AUC on this test month.\n",
+                m,if(delta>0) "exceeds" else "does not exceed",
+                abs(delta)))
+  }
+}
+```
+
+Training performance is descriptive, not independent evidence. Calibration scores
+are optimistic after selecting their maximum; the final test provides the
+held-out comparison. Increased complexity is supported only if it improves on
+both baselines in metrics relevant to the question. An AUC advantage does not
+guarantee better precision or recall at 0.5.
+
+**My reading of the classification results.**
+
+*The null model shows why accuracy is not enough.* It always predicts
+"expensive" and still gets 55% accuracy on August 2026, simply because 55% of
+records are expensive. But it never finds a single cheap station (recall 0,
+F1 0, AUC 0.5). Any model I keep has to do clearly better than this on recall,
+F1 and AUC, not just on accuracy.
+
+*Feature selection.* Both of the measures from Lab 7 now put the new
+site-history feature far ahead of everything else. Its calibration AUC is 0.85
+(historical) and 0.91 (recent), with deviance reductions of about 7,800 and
+11,100. Brand comes second (AUC 0.71 and 0.76; deviance reduction about 3,100
+and 4,000). In other words, *which station it is* says much more than *which
+brand it flies*: two BP stations can behave very differently, and the site
+feature sees that, while brand cannot. Weekday and day-of-month are close to
+useless on their own: AUC is about 0.51, and the deviance reduction is small or
+even negative. For day-of-month in the historical strategy, a negative value
+means that the ten decile bins fitted on training make the calibration
+predictions slightly *worse* than the null model, which is a small but clear
+sign of overfitting. As the target EDA showed, the label is balanced within
+every day and region, so weekday can only help through its interaction with
+brand.
+
+Region now passes the Lab 7 threshold in both strategies (deviance reduction
+115 and 45, above `minDrop = 10`) even though its AUC is only 0.51–0.53.
+Deviance rewards probabilities that are well calibrated, whereas AUC only
+measures ranking, so a variable can shift the predicted probabilities in the
+right direction without helping much to rank stations. So the deviance rule
+picks site history + brand + region in both strategies.
+
+The three feature sets end up very close. For SVM, the best calibration AUC is
+0.857 with all five features against 0.854 for the top two (historical), and
+0.9183 against 0.9182 (recent). For NB the difference is in the fourth decimal
+place. All five features won narrowly in every case, so that is what was
+selected. Once site history is in the model, brand, weekday and day add very
+little on top.
+
+*Is the extra complexity worth it?* Only barely, in both strategies:
+
+- With **historical** training, the site-history lookup alone reaches a test
+  AUC of 0.728. NB (0.722) does slightly worse, and SVM (0.731) is only 0.004
+  better. F1 is about 0.61 for all three.
+- With **recent** training, the picture is the same at a higher level: site
+  history alone 0.836, NB 0.837, SVM 0.839. SVM has the best F1 (0.737 vs
+  0.730) and recall (0.70 vs 0.69), with similar precision (about 0.78).
+
+So by the rule I set at the start, the more complex models are not really
+justified: a lookup table of each station's past cheap rate does almost as
+well. I still find it a useful result. It means that the main information is
+"this station is usually cheap", and that NB and SVM cannot find much extra
+structure in brand and calendar once they know that.
+
+Compared with the earlier version of this analysis (brand, region, weekday and
+day only), adding site history raised the recent-strategy SVM test AUC from
+about 0.73 to 0.84 and its F1 from about 0.62 to 0.74.
+
+Training and calibration AUC (about 0.86 historical, 0.91 recent) are higher
+than test AUC, and the gap is much bigger for the historical strategy (0.86 on
+calibration against 0.73 on the test). The historical calibration days are
+themselves from past Augusts, so they share the training distribution and could
+not warn me about the shift to 2026. This is a nice example of why a validation
+set only protects you if it looks like the data you will actually predict.
+
+## Explaining individual SVM predictions with LIME
+
+An AUC tells me how well the SVM ranks stations, but not *why* it calls a
+particular station cheap. Following Lab 6, I used LIME as an automated sanity
+check on the selected recent-strategy SVM. LIME does not know our model class
+out of the box, so the two methods it needs (`model_type` and `predict_model`)
+are registered for it. Day-of-month is binned into quartiles for the explanation.
+
+```{r lime-explain, fig.height=7, warning=FALSE}
+registerS3method("model_type","fuel_classifier",
+                 function(x,...) "classification",envir=asNamespace("lime"))
+registerS3method("predict_model","fuel_classifier",function(x,newdata,type,...) {
+  p <- predict_classifier(x,as.data.table(newdata))
+  data.frame(expensive=1-p,cheap=p)
+},envir=asNamespace("lime"))
+lime_cols <- fitted_models$Recent$models$SVM$features
+lime_train <- as.data.frame(encoded$Recent$svm_train[,..lime_cols])
+char_cols <- intersect(c("brand","region"),lime_cols)
+for (nm in char_cols) lime_train[[nm]] <- factor(lime_train[[nm]])
+explainer <- lime::lime(lime_train,model=fitted_models$Recent$models$SVM,
+                        bin_continuous=TRUE,n_bins=4)
+eligible <- encoded$Recent$test
+for (nm in char_cols) eligible <- eligible[get(nm) %in% levels(lime_train[[nm]])]
+set.seed(params$seed)
+pick <- function(rows) rows[sample.int(length(rows),1)]
+cases <- c(pick(eligible[,which(region=="METRO" & target=="cheap")]),
+           pick(eligible[,which(region=="METRO" & target=="expensive")]),
+           pick(eligible[,which(region!="METRO" & target=="cheap")]),
+           pick(eligible[,which(region!="METRO" & target=="expensive")]))
+lime_cases <- as.data.frame(eligible[cases,..lime_cols])
+for (nm in char_cols) lime_cases[[nm]] <- factor(lime_cases[[nm]],levels=levels(lime_train[[nm]]))
+tab(cbind(case=1:4,eligible[cases,.(brand,region,weekday,day,site_rate=round(site_rate,2),target)]))
+explanation <- lime::explain(lime_cases,explainer,n_labels=1,n_features=4)
+lime::plot_features(explanation)
+lime_summary <- as.data.table(explanation)[order(case,-abs(feature_weight)),
+  .(predicted=label[1],probability=label_prob[1],top_feature=feature_desc[1],
+    top_weight=feature_weight[1],fit=model_r2[1]),by=case]
+tab(lime_summary)
+fwrite(as.data.table(explanation)[,.(case,label,label_prob,feature_desc,feature_weight,model_r2)],
+       "outputs/lime_explanations.csv")
+```
+
+```{r lime-findings, results='asis'}
+site_top <- sum(grepl("site_rate",lime_summary$top_feature))
+correct <- sum(lime_summary$predicted==as.character(eligible[cases,target]))
+cat(sprintf("The SVM labels **%d of the 4** cases correctly. In **%d of the 4** cases, the feature with the largest LIME weight is site history.\n\n",
+            correct,site_top))
+```
+
+This is the kind of sanity check Lab 6 describes with the wolf-and-husky
+example. I wanted to make sure the SVM is not relying on something meaningless,
+such as a particular day-of-month bin. It is not. Site history has by far the
+largest weight in every case (about 0.44–0.57). Everything else (region, brand,
+weekday, day) is below 0.09, and usually below 0.03. This fits the
+single-variable results: once the model knows a station's track record, the
+other features barely move the prediction.
+
+Case 3 is a good example of what the new feature fixes. It is an Independent
+station in the Wheatbelt that was cheap that day. Most Independents *are*
+expensive (only about a quarter of their records are cheap), and in the earlier
+brand-only version of this analysis the SVM got exactly this kind of station
+wrong. This station, however, was cheap in 83% of its training records, so the
+SVM now calls it cheap with probability 0.87, and brand only pushes slightly the
+other way. The explanation fit (R² about 0.38–0.57) is moderate, because the
+local linear surrogate is only a rough approximation of the radial kernel. So I
+read the bars as "which way each feature pushes this prediction", not as exact
+effects.
+
+# Which training data works better?
+
+Both strategies use identical sample sizes, outcome rules, feature candidates,
+tuning grids and final test rows. Their category composition and time period may
+still differ. Compare price distributions as context, although prices are not
+predictors. A general price-level shock can affect historical-threshold labels
+more strongly than the local-relative label used here.
+
+```{r distribution-shift}
+shift <- rbindlist(lapply(names(pools),function(s) {
+  pools[[s]][,.(period=s,records=.N,sites=uniqueN(site),mean_price=mean(price),
+               sd_price=sd(price),cheap_fraction=mean(target=="cheap"))]
+}))
+shift <- rbind(shift,test[,.(period="August 2026 test",records=.N,sites=uniqueN(site),
+                mean_price=mean(price),sd_price=sd(price),cheap_fraction=mean(target=="cheap"))])
+tab(shift)
+unseen <- rbindlist(lapply(names(splits),function(s) {
+  data.table(strategy=s,new_site_fraction=mean(!test$site %in% splits[[s]]$train$site),
+             new_brand_fraction=mean(!test$brand %in% splits[[s]]$train$brand))
+}))
+tab(unseen)
+```
+
+## Paired uncertainty and common-site sensitivity
+
+Resample whole test dates jointly for both strategies, not individual rows,
+to preserve within-day dependence. The percentile interval below is descriptive:
+31 dates are few, consecutive days may be autocorrelated, and training uncertainty
+is not included. It is not a definitive causal or significance claim.
+
+```{r paired-bootstrap}
+set.seed(params$seed+100)
+date_indices <- split(seq_len(nrow(test)),test$date)
+bootstrap <- rbindlist(lapply(c("NB","SVM"),function(m) {
+  a <- test_predictions[strategy=="Historical"&model==m][order(row)]$probability
+  b <- test_predictions[strategy=="Recent"&model==m][order(row)]$probability
+  delta <- replicate(params$bootstrap_reps,{
+    sampled <- sample.int(length(date_indices),length(date_indices),replace=TRUE)
+    ix <- unlist(date_indices[sampled],use.names=FALSE)
+    auc_cheap(test$target[ix],b[ix])-auc_cheap(test$target[ix],a[ix])
+  })
+  data.table(model=m,recent_minus_historical=auc_cheap(test$target,b)-auc_cheap(test$target,a),
+             lower=quantile(delta,.025,na.rm=TRUE),upper=quantile(delta,.975,na.rm=TRUE))
+}))
+tab(bootstrap)
+shared_training_sites <- intersect(splits$Historical$train$site,splits$Recent$train$site)
+common_test <- test$site %in% shared_training_sites
+common_metrics <- test_predictions[site %in% shared_training_sites,
+   as.list(metrics(truth,probability)),by=.(strategy,model)]
+tab(common_metrics[,.(strategy,model,n,AUC,F1,Balanced_accuracy)])
+```
+
+The common-site sensitivity keeps the original region/day target definitions.
+Differences from the full test may reflect site coverage. It is a secondary
+analysis, not a reason to retune on the test set. A stronger study would repeat
+the locked protocol on additional target months; one August cannot establish a
+universal winner or stable seasonality across years.
+
+## What "more accurate" means here, and why recent data wins
+
+My prediction question is: *on a given day in August 2026, can I tell, before
+looking at the price, whether a ULP station will be cheaper than the local
+median?* So "more accurate" means **higher test AUC on August 2026**, i.e. better
+at ranking the cheap stations above the expensive ones. F1 and recall are my
+secondary measures, because a driver mainly cares about finding cheap stations.
+Accuracy alone is not useful here, as the null model already shows.
+
+On that definition, recent training wins clearly. Test AUC is higher by about
+0.11 for both NB and SVM, and the date-bootstrap intervals (roughly 0.10–0.13
+and 0.10–0.12) are far above zero. With the site-history feature the gap is
+about twice as big as in the earlier brand-only version (0.04–0.06), because
+this feature depends directly on *which* stations the training data has seen
+and how they behaved. The same pattern holds when I restrict the test to sites
+that appear in both training sets (SVM 0.840 vs 0.774), so it is not only about
+the recent strategy having seen more of the test sites.
+
+Why? The tables above suggest three reasons, all forms of distribution shift:
+
+1. **Site coverage.** About 24% of August 2026 test records come from sites that
+   never appear in the historical training data, against only 0.3% for the
+   recent strategy. The ~200 sites added in May 2026 are simply invisible to a
+   model trained on 2023–2025, and for them site history falls back to the
+   overall average. Restricting to shared sites closes the SVM gap from 0.108 to
+   0.066 AUC, so coverage explains roughly 40% of it.
+2. **The market changed after the shock.** The month-to-month stability of which
+   stations are cheap dropped sharply in March–April 2026. A station's track
+   record in August 2024 is a weaker guide to August 2026 than its record in
+   July 2026.
+3. **The weekly cycle weakened.** Before March 2026 the Metro Tuesday-to-Wednesday
+   jump was about 30 c/L. From March 2026 onwards it is only about 11–14 c/L.
+   Historical Augusts teach the model a cycle that is much weaker in the test
+   month.
+
+The argument *for* historical Augusts would be seasonality: perhaps August has
+its own month-specific pattern. I do not see much evidence for that. Day-of-month
+has no predictive value in either strategy, and the regional/brand ordering is
+stable across the year. For a relative label like this one, how recent the data
+is matters much more than matching the calendar month. I would expect the
+answer to be different for a fixed-price threshold (for example, predicting
+whether a price is below 180 c/L), where seasonal price levels would matter more.
+The caveat is that this is one test month just after an unusual shock, so I
+would not claim that recent data always wins.
+
+# Clustering site price profiles
+
+Clustering uses ULP observations in **May–July 2026**, a common pre-test window.
+Sites require at least 60 observed days; this is a reliability subset, not a
+cleaning deletion. Features describe average deviation from the regional/day
+median, price standard deviation, average absolute change between consecutive
+observed calendar days, and the fraction of consecutive-day price increases.
+Missing gaps are not treated as one-day changes.
+
+Features are Z-standardised so cents and proportions do not dominate merely
+because of units. Near-zero-variance columns and features correlated above
+|0.90| with an already retained feature are removed. K-means uses squared
+Euclidean distances; silhouette uses Euclidean distances on the same scaled
+features. Compare k=2–6 using silhouette and within-cluster sum of squares.
+
+```{r clustering}
+site_daily <- copy(ulp[year==2026 & month %in% 5:7])
+setorder(site_daily,site,date)
+site_daily[,change:=ifelse(as.integer(date-shift(date))==1,price-shift(price),NA_real_),by=site]
+profiles <- site_daily[,.(days=.N,site_name=site_name[.N],brand=brand[.N],region=region[.N],
+  mean_price=mean(price),relative_mean=mean(relative_price),price_sd=sd(price),
+  mean_abs_change=mean(abs(change),na.rm=TRUE),increase_rate=mean(change>0,na.rm=TRUE)),by=site]
+cluster_scope <- data.table(population=c("ULP sites in May–July","Sites with >=60 days"),
+                            sites=c(nrow(profiles),sum(profiles$days>=60)))
+profiles <- profiles[days>=60]
+candidate_features <- c("relative_mean","price_sd","mean_abs_change","increase_rate")
+valid <- complete.cases(profiles[,..candidate_features])
+cluster_scope <- rbind(cluster_scope,data.table(population="Complete numeric profiles",sites=sum(valid)))
+profiles <- profiles[valid]
+if (nrow(profiles)<20) stop("Too few sites for clustering.")
+candidate_features <- candidate_features[vapply(profiles[,..candidate_features],sd,numeric(1))>1e-8]
+correlations <- cor(profiles[,..candidate_features])
+cluster_features <- character()
+for (f in candidate_features) {
+  if (!length(cluster_features)||all(abs(correlations[f,cluster_features])<=.90)) {
+    cluster_features<-c(cluster_features,f)
+  }
+}
+scaled <- scale(as.matrix(profiles[,..cluster_features]))
+distance <- dist(scaled,method="euclidean")
+ks <- 2:min(6,nrow(profiles)-1)
+cluster_fits <- list()
+cluster_scores <- rbindlist(lapply(ks,function(k) {
+  set.seed(params$seed+k)
+  km <- kmeans(scaled,centers=k,nstart=30,iter.max=100)
+  cluster_fits[[as.character(k)]] <<- km
+  sil <- cluster::silhouette(km$cluster,distance)
+  data.table(k=k,WSS=km$tot.withinss,silhouette=mean(sil[,3]),
+             smallest_cluster=min(table(km$cluster)))
+}))
+best_k <- cluster_scores[which.max(silhouette),k]
+profiles[,cluster:=factor(cluster_fits[[as.character(best_k)]]$cluster)]
+pca <- prcomp(scaled,center=FALSE,scale.=FALSE)
+profiles[,":="(PC1=pca$x[,1],PC2=pca$x[,2])]
+cluster_centres <- profiles[,lapply(.SD,mean),by=cluster,
+  .SDcols=c("mean_price",candidate_features)]
+cluster_centres <- merge(cluster_centres,profiles[,.N,by=cluster],by="cluster")
+tab(cluster_scope)
+tab(as.data.table(correlations,keep.rownames="feature"))
+cat("Retained features:",paste(cluster_features,collapse=", "))
+tab(cluster_scores)
+tab(cluster_centres)
+```
+
+Before clustering I looked at how the four site features relate to each other,
+using the pairwise scatter grid and a smoothed scatter plot from Lab 4.
+
+```{r profile-pairs, fig.height=7}
+area_colour <- ifelse(profiles$region %in% c("METRO","PEEL"),"#167c80","#c36b39")
+pairs(profiles[,..candidate_features],col=area_colour,pch=20,cex=.6,
+      main="Site profile features (teal = Metro/Peel, orange = regional)")
+profiles[,area_type:=ifelse(region %in% c("METRO","PEEL"),"Metro and Peel","Regional WA")]
+ggplot(profiles,aes(mean_abs_change,increase_rate,colour=area_type))+
+ geom_point(alpha=.5)+geom_smooth(method="loess",se=FALSE)+
+ labs(title="Daily price movement vs share of days with a price rise",
+      x="Mean absolute day-to-day change (c/L)",y="Share of days with a rise",colour=NULL)
+```
+
+The pairs plot shows two clear things. First, the remote sites stand far apart
+on `relative_mean`, which is why I expect them to form their own group. Second,
+Metro/Peel sites (teal) and regional sites (orange) largely separate on the two
+movement features. The typical regional site moves by about 0.7 c/L a day and
+raises its price on about 5% of days, while the typical Metro site moves by about
+2.8 c/L and raises on about 18% of days. The smoothed scatter plot adds a less
+obvious pattern. Among Metro sites, those with moderate moves (1–2 c/L) raise
+prices most often (about 25% of days), while the big cyclers (6+ c/L moves)
+raise less often (about 16%) but by much more. This is what a price cycle looks
+like at site level: one sharp jump followed by several small cuts. Since the
+two movement features are related but clearly not the same thing, it makes
+sense that the correlation filter kept both.
+
+```{r cluster-plots}
+score_long <- melt(cluster_scores,id.vars="k",measure.vars=c("WSS","silhouette"))
+ggplot(score_long,aes(k,value))+geom_line(colour="#167c80")+geom_point(size=2)+
+ facet_wrap(~variable,scales="free_y")+
+ labs(title="Choosing the number of clusters",x="k",y=NULL)
+ggplot(profiles,aes(PC1,PC2,colour=cluster))+geom_point(alpha=.75,size=2)+
+ labs(title=paste("Site profiles: selected k =",best_k),
+ subtitle=sprintf("PCA projection explains %.1f%% of scaled-feature variance",
+                 100*sum(pca$sdev[1:2]^2)/sum(pca$sdev^2)),
+ x="Principal component 1",y="Principal component 2",colour="Cluster")
+```
+
+## Distance and algorithm sensitivity
+
+As a sensitivity check, PAM with Manhattan distance is fitted at the same k.
+Manhattan sums absolute coordinate differences; Euclidean emphasises larger
+coordinate differences. PAM also changes the representative from a mean to an
+observed medoid, so any difference cannot be attributed to distance alone.
+
+```{r distance-sensitivity}
+pam_fit <- cluster::pam(scaled,k=best_k,metric="manhattan")
+# Adjusted Rand index: agreement corrected for chance, invariant to label numbering.
+adjusted_rand <- function(a,b) {
+  choose2 <- function(x) x*(x-1)/2
+  t <- table(a,b)
+  observed <- sum(choose2(t))
+  r <- sum(choose2(rowSums(t))); c <- sum(choose2(colSums(t)))
+  expected <- r*c/choose2(sum(t))
+  denom <- (r+c)/2-expected
+  if (abs(denom)<1e-12) return(NA_real_)
+  (observed-expected)/denom
+}
+distance_sensitivity <- data.table(
+ method=c("K-means / Euclidean","PAM / Manhattan"),
+ silhouette=c(cluster_scores[k==best_k,silhouette],pam_fit$silinfo$avg.width))
+tab(distance_sensitivity)
+ari <- adjusted_rand(profiles$cluster,pam_fit$clustering)
+cat(sprintf("Adjusted Rand agreement: %.3f",ari))
+tab(as.data.frame.matrix(table(kmeans=profiles$cluster,pam=pam_fit$clustering)))
+```
+
+Silhouettes under different metrics are not identical objectives. Assess them
+with the profile table and assignment agreement, not just the larger number.
+Clusters are descriptive groups, not discovered causal pricing rules.
+
+```{r cluster-findings, results='asis'}
+for (i in seq_len(nrow(cluster_centres))) {
+  z <- cluster_centres[i]
+  cat(sprintf("\n- Cluster %s contains %d sites: average regional-relative price %.2f c/L, price SD %.2f c/L, and average absolute consecutive-day change %.2f c/L.\n",
+      z$cluster,z$N,z$relative_mean,z$price_sd,z$mean_abs_change))
+}
+```
+
+**Choosing k.** WSS falls steadily as k grows, as it always does, so on its own
+it does not give a clear elbow. The silhouette is more useful: it rises from
+0.38 at k=2 to a peak of 0.46 at k=5, then drops at k=6. At k=2 the split is
+basically "Perth versus everyone else" (94% of one cluster is Metro/Peel). From
+k=3 a small cluster of 21–25 very expensive remote sites separates out and
+survives at every larger k, and from k=4 the Metro sites split into a
+strongly cycling group and a cheaper, calmer group. Groups that keep
+reappearing as k changes look like real structure rather than noise. I
+chose k=5 because it has the best silhouette and every cluster still has at
+least 23 sites, so none of them is just a handful of outliers.
+
+**What the five groups look like** (cluster numbers are only labels; the
+region and brand mix comes from `profiles`):
+
+- *Metro price cyclers* (cluster 1, 194 sites, almost all Metro/Peel; mostly BP,
+  Ampol and 7-Eleven). These have by far the largest day-to-day moves (about
+  6.6 c/L on average) and sit slightly above the regional median. This is the
+  weekly cycle from the EDA, seen at site level.
+- *Metro discounters* (cluster 4, 283 sites, mostly Metro; Caltex, Reddy Express
+  and Vibe are the most common brands). These are cheaper than the median (about
+  −2.8 c/L), change price more gently, and raise prices on about a quarter of days.
+- *Stable regional sites* (cluster 3, 367 sites, spread across every regional
+  area). They are priced close to the local median and rarely change price.
+- *Expensive regional sites* (cluster 5, 64 sites, many Independents in the
+  Wheatbelt). They are about 18 c/L above the local median, but prices are still
+  sticky.
+- *Remote, very expensive sites* (cluster 2, 23 sites in Goldfields, Kimberley and
+  Pilbara). They average about 118 c/L above the regional median, and prices
+  almost never change (mean daily move 0.2 c/L).
+
+So the main "rule" the clustering finds is that two things separate WA stations:
+how far they sit from the local median, and whether they take part in the Perth
+price cycle. Pricing behaviour is much more about location than brand. The same
+brand (BP) shows up in the cycling group, the stable group and the remote group.
+
+On distance measures: I standardised the four features first. Without this,
+`relative_mean` (in c/L, with values over 100 for remote sites) would dominate
+`increase_rate` (a proportion between 0 and 1), and the clusters would just be
+price bands. Euclidean distance with k-means is sensitive to large gaps, which is
+partly why the remote group separates so cleanly. With Manhattan distance and PAM
+the silhouette is lower (0.37) and the agreement with k-means is moderate
+(ARI 0.61). The cross-table shows where they disagree. The two Metro groups are
+largely the same under both methods (189 of 194 cyclers and 246 of 283
+discounters match). The big stable regional group, however, is split three
+ways, and the 23 remote sites no longer form their own cluster: PAM spreads them
+across two other groups. This makes sense, because Manhattan distance does not
+square the large gap in `relative_mean`, and a medoid is an actual site rather
+than a mean that extreme values can pull towards them. So the choice of distance
+mostly decides whether extreme sites get their own group. For this question I
+prefer the Euclidean version, because the remote stations really do behave
+differently.
+
+# Conclusions and limitations
+
+```{r conclusion, results='asis'}
+cat(sprintf("The study combined **%s raw records from %d monthly files**, retaining **%s** after quality cleaning (%.4f%% removed).\n\n",
+            format(raw_n,big.mark=","),nrow(manifest),format(nrow(d),big.mark=","),100*drop_rate))
+for (i in seq_len(nrow(bootstrap))) {
+  z <- bootstrap[i]
+  cat(sprintf("For %s, recent training minus historical training gives **%.3f test AUC**, with a date-bootstrap interval [%.3f, %.3f].\n\n",
+              z$model,z$recent_minus_historical,z$lower,z$upper))
+}
+cat(sprintf("The site-profile analysis selects **k=%d** by silhouette among the tested values. Use the centroid descriptions to interpret groups, rather than treating cluster numbers as an order.\n",best_k))
+```
+
+**Summary of what I found.**
+
+- WA fuel prices are driven by a shared cost level, with stable layers on top
+  of it: product (LPG cheapest, diesel/98 RON most expensive), region (Perth
+  cheapest, Kimberley about 50 c/L dearer) and, in Perth only, a weekly cycle
+  with the cheapest prices on Tuesday.
+- The March 2026 shock pushed ULP up by about a third in one month. It barely
+  affected the balance of my relative "cheap" label, but it reshuffled which
+  stations were cheap for a couple of months and weakened the Perth cycle.
+- A station's own track record is the best predictor by far. A smoothed
+  "share of cheap days in training" reaches a test AUC of 0.73 (historical) and
+  0.84 (recent), well above brand alone (about 0.70). NB and SVM add only
+  0.001–0.004 AUC on top, so the simple lookup is nearly as good. Tuning the
+  probability cut-off on calibration raises recall (for the recent SVM from 0.70
+  to 0.77) at some cost in precision. Oversampling helps less.
+- For this question, recent months are clearly better training data than past
+  Augusts, mainly because of changes in site coverage and market behaviour after
+  the shock, not because of seasonality.
+- Stations fall into five behaviour types. Location and participation in the
+  price cycle separate them much more than brand does.
+
+The label measures **relative local affordability**, not inflation or historically
+cheap fuel. If common price levels change, that alone need not change the label.
+
+Key limits are changing reporting coverage, site-key ambiguity, equal site-day
+rather than sales weighting, an SVM trained on only 4,000 rows, repeated
+observations of sites, validation/test distribution differences and only one
+final test month. Test dates are dependent, so the bootstrap interval is only a
+descriptive uncertainty check. More data do not automatically remove these limits.
+
+# Shiny hand-off and reproducibility
+
+The app consumes a compact bundle computed by this notebook. It does not retrain
+models when filters change. Exploration filters affect only exploration;
+classification uses the fixed ULP population and August 2026 test set. Cluster
+views use May–July 2026 site profiles. The app explains these scopes explicitly.
+
+```{r export}
+fwrite(evaluation,"outputs/model_metrics.csv")
+fwrite(single_scores,"outputs/single_variable_scores.csv")
+fwrite(tuning_scores,"outputs/tuning_scores.csv")
+fwrite(selected_models,"outputs/selected_models.csv")
+fwrite(split_audit,"outputs/split_audit.csv")
+fwrite(bootstrap,"outputs/strategy_bootstrap.csv")
+fwrite(cluster_scores,"outputs/cluster_k_scores.csv")
+fwrite(cluster_centres,"outputs/cluster_profiles.csv")
+fwrite(scope_audit,"outputs/model_scope.csv")
+cluster_assignments <- lapply(cluster_fits,function(fit) fit$cluster)
+bundle <- list(monthly=monthly,daily=daily,brand_month=brand_month,
+ plot_sample=plot_sample[,.(date,month_date,product,region,brand,price)],
+ coverage=coverage,quality=quality,manifest=manifest,evaluation=evaluation,
+ roc=roc_data,single_scores=single_scores,tuning=tuning_scores,
+ selected=selected_models,bootstrap=bootstrap,profiles=profiles,
+ cluster_scores=cluster_scores,cluster_assignments=cluster_assignments,
+ best_k=best_k,cluster_features=cluster_features,scope=scope_audit,
+ target_brand=target_brand,
+ dates=c(start_date,end_date),created=Sys.time())
+saveRDS(bundle,"outputs/dashboard_data.rds")
+saveRDS(list(models=fitted_models,predictions=test_predictions,
+             parameters=params,selected=selected_models),"outputs/fitted_models.rds")
+writeLines(capture.output(sessionInfo()),"outputs/sessionInfo.txt")
+stopifnot(nrow(manifest)==44,all(manifest$complete),drop_rate<=.05,!anyNA(missing_audit$missing),
+          all(evaluation$AUC>=0 & evaluation$AUC<=1),
+          all(evaluation[split=="Test",n]==nrow(test)),
+          !anyNA(test_predictions$probability),
+          all(test_predictions$date>=test_start),
+          nrow(profiles)==length(cluster_assignments[[as.character(best_k)]]))
+cat("All end-of-pipeline integrity checks passed.")
+```
+
+```{r session-info}
+sessionInfo()
+```
+
